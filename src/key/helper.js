@@ -333,6 +333,163 @@ export async function mergeSignatures(source, dest, attr, date = new Date(), che
 }
 
 /**
+ * Returns the keys that the given key's owner has declared as authorized revokers.
+ *
+ * Only direct-key self-signatures (Type ID 0x1F) are considered: per RFC4880 5.2.3.15, that is the
+ * location of the Revocation Key subpacket, and its use in other self-signatures is unspecified.
+ * The declarations are gathered regardless of the self-signature's expiration date, so that a designated
+ * revoker remains available even after the self-signature that declared it has expired.
+ *
+ * @param {Key} key - The key to inspect
+ * @param {Object} config - Full configuration
+ * @returns {Promise<Array<{
+ *   revocationKeyFingerprint: Uint8Array,
+ *   revocationKeyAlgorithm: module:enums.publicKey,
+ *   revocationKeyClass: Integer,
+ *   created: Date
+ * }>>} The declared revokers, deduplicated by fingerprint (keeping the earliest declaration).
+ * @async
+ */
+export async function getDesignatedRevocationKeys(key, config = defaultConfig) {
+  const primaryKey = key.keyPacket;
+  if (!primaryKey) {
+    return [];
+  }
+  const primaryKeyID = primaryKey.getKeyID();
+  // Per RFC4880 5.2.3.15, the revocation key subpacket is only found on a Direct Key self-signature.
+  // Its use elsewhere is unspecified, hence it is rejected outright when parsing/verifying the signature
+  // (see `SignaturePacket#verify`), and not considered here.
+  const selfSignatures = key.directSignatures
+    .filter(sig => sig.signatureType === enums.signature.key)
+    .map(sig => ({ sig, dataToVerify: { key: primaryKey } }));
+
+  const declarations = new Map();
+  await Promise.all(selfSignatures.map(async ({ sig, dataToVerify }) => {
+    if (sig.revocationKeyClass === null || sig.revocationKeyFingerprint === null ||
+        sig.revocationKeyAlgorithm === null) {
+      return;
+    }
+    // The class octet must have bit 0x80 set, see RFC4880 5.2.3.15
+    if (!(sig.revocationKeyClass & 0x80)) {
+      return;
+    }
+    // Only the key owner can authorize a revoker
+    if (!sig.issuerKeyID.equals(primaryKeyID)) {
+      return;
+    }
+    try {
+      // The declaration is checked for cryptographic validity only: its expiration date is
+      // intentionally ignored, so that the revoker remains available after the declaration expires.
+      await sig.verify(primaryKey, enums.signature.key, dataToVerify, null, false, config);
+    } catch {
+      return;
+    }
+    // The declaration predates the revocation it authorizes. We keep the earliest declaration
+    // per fingerprint, as that is the one that matters for the authorization time check.
+    const fingerprintHex = util.uint8ArrayToHex(sig.revocationKeyFingerprint);
+    const existing = declarations.get(fingerprintHex);
+    if (!existing || sig.created < existing.created) {
+      declarations.set(fingerprintHex, {
+        revocationKeyFingerprint: sig.revocationKeyFingerprint,
+        revocationKeyAlgorithm: sig.revocationKeyAlgorithm,
+        revocationKeyClass: sig.revocationKeyClass,
+        created: sig.created
+      });
+    }
+  }));
+  return [...declarations.values()];
+}
+
+/**
+ * Returns the configured public key (packet) matching the given revocation key fingerprint, if any.
+ * @param {Uint8Array} fingerprint - Revocation key fingerprint, as declared in the Revocation Key subpacket
+ * @param {Object} config - Full configuration
+ * @returns {PublicKeyPacket|SecretKeyPacket|null} The matching revoker key packet, or null.
+ */
+export function getConfiguredRevokerKeyPacket(fingerprint, config) {
+  const candidates = config.designatedRevokers || [];
+  for (const candidate of candidates) {
+    const keyPacket = candidate && (candidate.keyPacket || candidate);
+    if (!keyPacket || typeof keyPacket.getFingerprintBytes !== 'function') {
+      continue;
+    }
+    if (util.equalsUint8Array(keyPacket.getFingerprintBytes(), fingerprint)) {
+      return keyPacket;
+    }
+  }
+  return null;
+}
+
+/**
+ * Returns the public key packet of the designated revoker that authorizes the given revocation signature,
+ * if the revoker key is available via `config.designatedRevokers`.
+ *
+ * The revocation is only authorized if:
+ * - the declaration has the 0x80 class bit set;
+ * - the declaration is not newer than the revocation signature (a revoker cannot retroactively be authorized);
+ * - the declared algorithm matches the algorithm of the revocation signature;
+ * - the configured revoker key has the declared fingerprint, and its key ID matches the signature issuer.
+ *
+ * @param {Object} declaration - A declaration returned by {@link getDesignatedRevocationKeys}
+ * @param {SignaturePacket} revocationSignature - The third-party revocation signature
+ * @param {Object} config - Full configuration
+ * @returns {PublicKeyPacket|SecretKeyPacket|null} The revoker key packet, or null if not authorized.
+ */
+export function getDesignatedRevokerKeyPacket(declaration, revocationSignature, config) {
+  if (!(declaration.revocationKeyClass & 0x80)) {
+    return null;
+  }
+  if (declaration.created > revocationSignature.created) {
+    return null;
+  }
+  if (declaration.revocationKeyAlgorithm !== revocationSignature.publicKeyAlgorithm) {
+    return null;
+  }
+  const revokerKeyPacket = getConfiguredRevokerKeyPacket(declaration.revocationKeyFingerprint, config);
+  if (!revokerKeyPacket || typeof revokerKeyPacket.getKeyID !== 'function') {
+    return null;
+  }
+  if (!revocationSignature.issuerKeyID.equals(revokerKeyPacket.getKeyID())) {
+    return null;
+  }
+  return revokerKeyPacket;
+}
+
+/**
+ * Normalizes a designated revoker declaration to a fingerprint and public key algorithm.
+ * The revoker can be given as a key object, or as a hex fingerprint. In the latter case, the revoker's
+ * public key must also be listed in `config.designatedRevokers`, so that its algorithm can be determined.
+ * @param {String|Key|Subkey|PublicKeyPacket|SecretKeyPacket} revoker - Designated revoker identifier
+ * @param {Object} config - Full configuration
+ * @returns {{ fingerprint: Uint8Array, algorithm: module:enums.publicKey }}
+ */
+export function resolveDesignatedRevoker(revoker, config) {
+  const keyPacket = revoker && (revoker.keyPacket || revoker);
+  if (keyPacket && typeof keyPacket.getFingerprintBytes === 'function' && typeof keyPacket.getKeyID === 'function') {
+    return {
+      fingerprint: keyPacket.getFingerprintBytes(),
+      algorithm: keyPacket.algorithm
+    };
+  }
+  if (util.isString(revoker)) {
+    const fingerprintHex = revoker.replace(/\s/g, '').toLowerCase();
+    if (!/^[0-9a-f]+$/.test(fingerprintHex) || fingerprintHex.length % 2 !== 0) {
+      throw new Error('Invalid designated revoker fingerprint');
+    }
+    const fingerprint = util.hexToUint8Array(fingerprintHex);
+    const configuredKeyPacket = getConfiguredRevokerKeyPacket(fingerprint, config);
+    if (!configuredKeyPacket) {
+      throw new Error('The designated revoker key is unknown: pass the revoker key object, or provide it via `config.designatedRevokers`');
+    }
+    return {
+      fingerprint,
+      algorithm: configuredKeyPacket.algorithm
+    };
+  }
+  throw new Error('Invalid designated revoker: expected a key object or a hex fingerprint');
+}
+
+/**
  * Checks if a given certificate or binding signature is revoked
  * @param  {SecretKeyPacket|
  *          PublicKeyPacket}        primaryKey   The primary key packet
@@ -345,43 +502,66 @@ export async function mergeSignatures(source, dest, attr, date = new Date(), che
  *          SecretKeyPacket} key, optional The key packet to verify the signature, instead of the primary key
  * @param {Date} date - Use the given date instead of the current time
  * @param {Object} config - Full configuration
+ * @param {Array<Object>} [designatedRevocationKeys] - Revokers declared by the primary key's self-signatures,
+ *        as returned by {@link getDesignatedRevocationKeys}
  * @returns {Promise<Boolean>} True if the signature revokes the data.
  * @async
  */
-export async function isDataRevoked(primaryKey, signatureType, dataToVerify, revocations, signature, key, date = new Date(), config) {
+export async function isDataRevoked(primaryKey, signatureType, dataToVerify, revocations, signature, key, date = new Date(), config, designatedRevocationKeys = []) {
   key = key || primaryKey;
   const revocationKeyIDs = [];
+  let revokedByDesignatedRevoker = false;
+  // Whether `signature` (if any) belongs to the primary key, and can therefore be revoked by a designated revoker.
+  // A designated revoker cannot revoke a third party's certification of this key.
+  const isSelfIssuedSignature = !signature || signature.issuerKeyID.equals(primaryKey.getKeyID());
+  // Per RFC4880 5.2.1, a designated revoker is only authorized to issue key revocation (0x20) and
+  // subkey revocation (0x28) signatures; it cannot revoke User ID certifications.
+  const canBeRevokedByDesignatedRevoker = isSelfIssuedSignature &&
+    (signatureType === enums.signature.keyRevocation || signatureType === enums.signature.subkeyRevocation);
   await Promise.all(revocations.map(async function(revocationSignature) {
     try {
-      if (
-        // Note: a third-party revocation signature could legitimately revoke a
-        // self-signature if the signature has an authorized revocation key.
-        // However, we don't support passing authorized revocation keys, nor
-        // verifying such revocation signatures. Instead, we indicate an error
-        // when parsing a key with an authorized revocation key, and ignore
-        // third-party revocation signatures here. (It could also be revoking a
-        // third-party key certification, which should only affect
-        // `verifyAllCertifications`.)
-        !signature || revocationSignature.issuerKeyID.equals(signature.issuerKeyID)
-      ) {
-        const isHardRevocation = ![
-          enums.reasonForRevocation.keyRetired,
-          enums.reasonForRevocation.keySuperseded,
-          enums.reasonForRevocation.userIDInvalid
-        ].includes(revocationSignature.reasonForRevocationFlag);
+      // When no target signature is given, we are checking whether the primary key itself is revoked,
+      // hence a self revocation is one issued by the primary key.
+      const revokedIssuerKeyID = signature ? signature.issuerKeyID : primaryKey.getKeyID();
+      const isSelfRevocation = revocationSignature.issuerKeyID.equals(revokedIssuerKeyID);
+      const isHardRevocation = ![
+        enums.reasonForRevocation.keyRetired,
+        enums.reasonForRevocation.keySuperseded,
+        enums.reasonForRevocation.userIDInvalid
+      ].includes(revocationSignature.reasonForRevocationFlag);
+      const verificationDate = isHardRevocation ? null : date;
 
+      if (isSelfRevocation) {
         await revocationSignature.verify(
-          key, signatureType, dataToVerify, isHardRevocation ? null : date, false, config
+          key, signatureType, dataToVerify, verificationDate, false, config
         );
-
         // TODO get an identifier of the revoked object instead
         revocationKeyIDs.push(revocationSignature.issuerKeyID);
+        return;
+      }
+
+      // Third-party revocation signatures are ignored, to avoid a malicious actor revoking a key
+      // that did not authorize them. The only exception are revokers explicitly declared by the key owner.
+      if (!canBeRevokedByDesignatedRevoker) {
+        return;
+      }
+      for (const declaration of designatedRevocationKeys) {
+        const revokerKeyPacket = getDesignatedRevokerKeyPacket(declaration, revocationSignature, config);
+        if (!revokerKeyPacket) {
+          continue;
+        }
+        await revocationSignature.verify(
+          revokerKeyPacket, signatureType, dataToVerify, verificationDate, false, config
+        );
+        revokedByDesignatedRevoker = true;
+        revocationKeyIDs.push(revocationSignature.issuerKeyID);
+        return;
       }
     } catch {}
   }));
   // TODO further verify that this is the signature that should be revoked
   if (signature) {
-    signature.revoked = revocationKeyIDs.some(keyID => keyID.equals(signature.issuerKeyID)) ? true :
+    signature.revoked = revocationKeyIDs.some(keyID => keyID.equals(signature.issuerKeyID)) || revokedByDesignatedRevoker ? true :
       signature.revoked || false;
     return signature.revoked;
   }

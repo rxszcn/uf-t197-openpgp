@@ -186,6 +186,49 @@ class PrivateKey extends PublicKey {
   }
 
   /**
+   * Returns the key as a new key with a direct-key self-signature declaring the given key as
+   * a designated revoker (see {@link https://www.rfc-editor.org/rfc/rfc4880.html#section-5.2.3.15|RFC4880 5.2.3.15}).
+   *
+   * Once declared, a revocation signature issued by the revoker key is accepted, as long as the revoker's
+   * public key is provided via `config.designatedRevokers` (indexed by its fingerprint) when validating the
+   * revoked key.
+   *
+   * This is only supported for v4 keys: the Revocation Key subpacket carries a 20-octet v4 fingerprint,
+   * and RFC9580 deprecates it for v6 keys.
+   * @param {PublicKey|String} revoker - The designated revoker key, or its hex fingerprint. When passing a
+   *                                     fingerprint, the revoker key must also be provided via `config.designatedRevokers`
+   *                                     so that its public key algorithm can be determined.
+   * @param {Date} [date] - Creation date of the declaration, defaults to the current time
+   * @param {Object} [config] - Full configuration, defaults to openpgp.config
+   * @returns {Promise<PrivateKey>} New key with the designation.
+   * @throws {Error} if the private key is not decrypted or not a v4 key, or if the revoker is invalid.
+   * @async
+   */
+  async addRevoker(revoker, date = new Date(), config = defaultConfig) {
+    if (!this.keyPacket.isDecrypted()) {
+      throw new Error('Signing key is not decrypted.');
+    }
+    if (this.keyPacket.version !== 4) {
+      throw new Error('Designated revokers are only supported for v4 keys');
+    }
+    const { fingerprint, algorithm } = helper.resolveDesignatedRevoker(revoker, config);
+    if (fingerprint.length !== 20) {
+      throw new Error('The designated revoker must be a v4 key');
+    }
+    const signaturePacket = await helper.createSignaturePacket(
+      { key: this.keyPacket }, [], this.keyPacket, {
+        signatureType: enums.signature.key,
+        revocationKeyClass: 0x80, // bit 0x80 must be set, see RFC4880 5.2.3.15
+        revocationKeyAlgorithm: algorithm,
+        revocationKeyFingerprint: fingerprint
+      }, date, undefined, undefined, undefined, config
+    );
+    const key = this.clone();
+    key.directSignatures.push(signaturePacket);
+    return key;
+  }
+
+  /**
    * Revokes the key
    * @param {Object} reasonForRevocation - optional, object indicating the reason for revocation
    * @param  {module:enums.reasonForRevocation} reasonForRevocation.flag optional, flag indicating the reason for revocation

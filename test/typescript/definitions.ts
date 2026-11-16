@@ -75,6 +75,21 @@ import {
   expect(revokedKeyPair.privateKey).to.be.null;
   expect(revokedKeyPair.publicKey).to.be.instanceOf(PublicKey);
 
+  // Designated revokers (v4 keys only)
+  const v4KeyPair = await generateKey({ userIDs: [{ email: 'target@corp.co' }], format: 'object' });
+  const v4RevokerPair = await generateKey({ userIDs: [{ email: 'revoker@corp.co' }], format: 'object' });
+  const revokerConfig = { ...config, designatedRevokers: [v4RevokerPair.publicKey] };
+  const keyWithRevoker: PrivateKey = await v4KeyPair.privateKey.addRevoker(v4RevokerPair.publicKey, new Date(), revokerConfig);
+  const revokerDeclarations = await keyWithRevoker.getDesignatedRevokers();
+  expect(revokerDeclarations[0].revocationKeyFingerprint).to.be.instanceOf(Uint8Array);
+  const designatedRevocationCertificate: string = await keyWithRevoker.getDesignatedRevocationCertificate(
+    v4RevokerPair.privateKey, undefined, new Date(), revokerConfig
+  );
+  const keyRevokedByDesignatedRevoker = await keyWithRevoker.applyRevocationCertificate(
+    designatedRevocationCertificate, new Date(), revokerConfig
+  );
+  expect(keyRevokedByDesignatedRevoker).to.be.instanceOf(PublicKey);
+
   // Encrypt text message (armored)
   const text = 'hello';
   const textMessage = await createMessage({ text: 'hello', format: 'text' });

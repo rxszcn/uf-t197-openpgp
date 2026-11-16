@@ -19,6 +19,7 @@
 import { armor, unarmor } from '../encoding/armor.js';
 import {
   PacketList,
+  PublicKeyPacket,
   SignaturePacket
 } from '../packet/index.js';
 import defaultConfig from '../config.ts';
@@ -29,8 +30,10 @@ import Subkey from './subkey.js';
 import * as helper from './helper.js';
 import { UnparseablePacket } from '../packet/packet.js';
 
-// A key revocation certificate can contain the following packets
-const allowedRevocationPackets = /*#__PURE__*/ util.constructAllowedPackets([SignaturePacket]);
+// A key revocation certificate can contain the following packets.
+// A designated revocation certificate also embeds the public key packet of the revoked key, which GnuPG
+// requires in order to locate the key the certificate applies to.
+const allowedRevocationPackets = /*#__PURE__*/ util.constructAllowedPackets([PublicKeyPacket, SignaturePacket]);
 const mainKeyPacketTags = new Set([enums.packet.publicKey, enums.packet.secretKey]);
 const keyPacketTags = new Set([
   enums.packet.publicKey, enums.packet.secretKey,
@@ -380,8 +383,28 @@ class Key {
    */
   async isRevoked(signature, key, date = new Date(), config = defaultConfig) {
     return helper.isDataRevoked(
-      this.keyPacket, enums.signature.keyRevocation, { key: this.keyPacket }, this.revocationSignatures, signature, key, date, config
+      this.keyPacket, enums.signature.keyRevocation, { key: this.keyPacket }, this.revocationSignatures, signature, key, date, config,
+      await helper.getDesignatedRevocationKeys(this, config)
     );
+  }
+
+  /**
+   * Returns the keys that this key's owner has declared as authorized revokers,
+   * via a Revocation Key subpacket in a direct-key self-signature.
+   * The returned fingerprints can be used to provide the corresponding keys via `config.designatedRevokers`.
+   * @param {Object} [config] - Full configuration, defaults to openpgp.config
+   * @returns {Promise<Array<{
+   *   revocationKeyFingerprint: Uint8Array,
+   *   revocationKeyAlgorithm: module:enums.publicKey,
+   *   revocationKeyClass: Integer
+   * }>>} The declared revokers, deduplicated by fingerprint.
+   * @async
+   */
+  async getDesignatedRevokers(config = defaultConfig) {
+    const declarations = await helper.getDesignatedRevocationKeys(this, config);
+    return declarations.map(({ revocationKeyFingerprint, revocationKeyAlgorithm, revocationKeyClass }) => ({
+      revocationKeyFingerprint, revocationKeyAlgorithm, revocationKeyClass
+    }));
   }
 
   /**
@@ -569,8 +592,15 @@ class Key {
     // hence we don't need to convert the destination key type
     const updatedKey = this.clone();
     // revocation signatures
+    const designatedRevocationKeys = [
+      ...await helper.getDesignatedRevocationKeys(updatedKey, config),
+      ...await helper.getDesignatedRevocationKeys(sourceKey, config)
+    ];
     await helper.mergeSignatures(sourceKey, updatedKey, 'revocationSignatures', date, srcRevSig => {
-      return helper.isDataRevoked(updatedKey.keyPacket, enums.signature.keyRevocation, updatedKey, [srcRevSig], null, sourceKey.keyPacket, date, config);
+      return helper.isDataRevoked(
+        updatedKey.keyPacket, enums.signature.keyRevocation, updatedKey, [srcRevSig], null, sourceKey.keyPacket, date, config,
+        designatedRevocationKeys
+      );
     });
     // direct signatures
     await helper.mergeSignatures(sourceKey, updatedKey, 'directSignatures', date);
@@ -634,6 +664,10 @@ class Key {
    * Applies a revocation certificate to a key
    * This adds the first signature packet in the armored text to the key,
    * if it is a valid revocation signature.
+   *
+   * The revocation signature can be issued either by the key itself, or by a key that was
+   * declared as a designated revoker in this key's direct-key self-signature (and provided
+   * via `config.designatedRevokers`).
    * @param {String} revocationCertificate - armored revocation certificate
    * @param {Date} [date] - Date to verify the certificate
    * @param {Object} [config] - Full configuration, defaults to openpgp.config
@@ -647,17 +681,84 @@ class Key {
     if (!revocationSignature || revocationSignature.signatureType !== enums.signature.keyRevocation) {
       throw new Error('Could not find revocation signature packet');
     }
-    if (!revocationSignature.issuerKeyID.equals(this.getKeyID())) {
+    const embeddedKeyPacket = packetlist.findPacket(enums.packet.publicKey);
+    if (embeddedKeyPacket && !embeddedKeyPacket.hasSameFingerprintAs(this.keyPacket)) {
       throw new Error('Revocation signature does not match key');
     }
-    try {
-      await revocationSignature.verify(this.keyPacket, enums.signature.keyRevocation, { key: this.keyPacket }, date, undefined, config);
-    } catch (e) {
-      throw util.wrapError('Could not verify revocation signature', e);
+    if (revocationSignature.issuerKeyID.equals(this.getKeyID())) {
+      try {
+        await revocationSignature.verify(this.keyPacket, enums.signature.keyRevocation, { key: this.keyPacket }, date, undefined, config);
+      } catch (e) {
+        throw util.wrapError('Could not verify revocation signature', e);
+      }
+    } else {
+      // A third-party revocation is only accepted if issued by a designated revoker, whose public key
+      // must be provided via `config.designatedRevokers`.
+      const isRevokedByDesignatedRevoker = await helper.isDataRevoked(
+        this.keyPacket, enums.signature.keyRevocation, { key: this.keyPacket },
+        [revocationSignature], null, this.keyPacket, date, config,
+        await helper.getDesignatedRevocationKeys(this, config)
+      );
+      if (!isRevokedByDesignatedRevoker) {
+        throw new Error('Revocation signature does not match key');
+      }
     }
     const key = this.clone();
     key.revocationSignatures.push(revocationSignature);
     return key;
+  }
+
+  /**
+   * Revokes the key using a designated revoker: this requires the designated revoker's private key.
+   * The key must have declared `revokerPrivateKey` as a designated revoker in a direct-key self-signature
+   * (see {@link Key#getDesignatedRevokers}). The returned revocation certificate can be applied to the key
+   * with {@link Key#applyRevocationCertificate}, provided that the revoker's public key is available via
+   * `config.designatedRevokers` when the resulting key is validated.
+   * @param {PrivateKey} revokerPrivateKey - The decrypted designated revoker's private key
+   * @param {Object} [reasonForRevocation] - optional, object indicating the reason for revocation
+   * @param  {module:enums.reasonForRevocation} [reasonForRevocation.flag] - flag indicating the reason for revocation
+   * @param  {String} [reasonForRevocation.string] - string explaining the reason for revocation
+   * @param {Date} [date] - optional, override the creationtime of the revocation signature
+   * @param {Object} [config] - Full configuration, defaults to openpgp.config
+   * @returns {Promise<String>} Armored revocation certificate.
+   * @async
+   */
+  async getDesignatedRevocationCertificate(
+    revokerPrivateKey,
+    {
+      flag: reasonForRevocationFlag = enums.reasonForRevocation.noReason,
+      string: reasonForRevocationString = ''
+    } = {},
+    date = new Date(),
+    config = defaultConfig
+  ) {
+    if (!revokerPrivateKey || !revokerPrivateKey.isPrivate()) {
+      throw new Error('Need private key for revoking');
+    }
+    const declarations = await helper.getDesignatedRevocationKeys(this, config);
+    const isDeclared = declarations.some(declaration => (
+      util.equalsUint8Array(revokerPrivateKey.keyPacket.getFingerprintBytes(), declaration.revocationKeyFingerprint)
+    ));
+    if (!isDeclared) {
+      throw new Error('The given key is not a designated revoker of this key');
+    }
+    const dataToSign = { key: this.keyPacket };
+    const revocationSignature = await helper.createSignaturePacket(dataToSign, [], revokerPrivateKey.keyPacket, {
+      signatureType: enums.signature.keyRevocation,
+      reasonForRevocationFlag: enums.write(enums.reasonForRevocation, reasonForRevocationFlag),
+      reasonForRevocationString
+    }, date, undefined, undefined, true, config);
+    const packetlist = new PacketList();
+    // The revoked key's public-key packet is embedded so that the certificate can be located
+    // (e.g. imported by GnuPG) without relying on the issuer: with a designated revoker, the issuer
+    // of the revocation signature is not the revoked key.
+    packetlist.push(this.keyPacket.constructor.tag === enums.packet.secretKey ?
+      PublicKeyPacket.fromSecretKeyPacket(this.keyPacket) :
+      this.keyPacket);
+    packetlist.push(revocationSignature);
+    // An ASCII-armored Transferable Public Key packet sequence of a v6 key MUST NOT contain a CRC24 footer.
+    const emitChecksum = this.keyPacket.version !== 6;
+    return armor(enums.armor.publicKey, packetlist.write(), null, null, 'This is a revocation certificate', emitChecksum, config);
   }
 
   /**

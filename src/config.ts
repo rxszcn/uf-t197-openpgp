@@ -44,6 +44,7 @@ export interface Config {
   allowInsecureDecryptionWithSigningKeys: boolean;
   allowInsecureVerificationWithReformattedKeys: boolean;
   allowMissingKeyFlags: boolean;
+  designatedRevokers: any[];
   constantTimePKCS1Decryption: boolean;
   constantTimePKCS1DecryptionSupportedSymmetricAlgorithms: Set<enums.symmetric>;
   v6Keys: boolean;
@@ -245,6 +246,20 @@ const config: Config = {
    * This setting allows using such keys for any operation for which they are compatible, based on their public key algorithm.
    */
   allowMissingKeyFlags: false,
+  /**
+   * Public keys of the designated revokers (see {@link https://www.rfc-editor.org/rfc/rfc4880.html#section-5.2.3.15|RFC4880 5.2.3.15})
+   * to take into account when checking whether a key has been revoked by a third party.
+   * A third-party revocation signature is only accepted if it is issued by a key that the revoked key has declared
+   * as a designated revoker (via the Revocation Key subpacket, see `Key#getDesignatedRevokers()`), and if that
+   * revoker's public key is listed here. Revocation signatures issued by keys that are not declared, or whose
+   * public key is not available here, are ignored.
+   * The revoker keys can also be made known to this library through `PrivateKey#addRevoker` when declaring them.
+   * Note: the application is responsible for providing up-to-date and trusted revoker keys. This library only
+   * checks that a provided key matches the declared fingerprint, and that the revocation signature is valid.
+   * @memberof module:config
+   * @property {Array<PublicKey>} designatedRevokers
+   */
+  designatedRevokers: [],
   /**
    * Enable constant-time decryption of RSA- and ElGamal-encrypted session keys, to hinder Bleichenbacher-like attacks (https://link.springer.com/chapter/10.1007/BFb0055716).
    * This setting has measurable performance impact and it is only helpful in application scenarios where both of the following conditions apply:

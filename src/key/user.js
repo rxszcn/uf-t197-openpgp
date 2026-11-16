@@ -6,7 +6,7 @@
 import enums from '../enums.ts';
 import util from '../util.js';
 import { PacketList } from '../packet/index.js';
-import { mergeSignatures, isDataRevoked, createSignaturePacket } from './helper.js';
+import { mergeSignatures, isDataRevoked, createSignaturePacket, getDesignatedRevocationKeys } from './helper.js';
 import defaultConfig from '../config.ts';
 
 /**
@@ -101,7 +101,8 @@ class User {
       key: primaryKey,
       userID: this.userID,
       userAttribute: this.userAttribute
-    }, this.revocationSignatures, certificate, keyPacket, date, config);
+    }, this.revocationSignatures, certificate, keyPacket, date, config,
+    await getDesignatedRevocationKeys(this.mainKey, config));
   }
 
   /**
@@ -230,8 +231,15 @@ class User {
     // other signatures
     await mergeSignatures(sourceUser, this, 'otherCertifications', date);
     // revocation signatures
+    const designatedRevocationKeys = [
+      ...await getDesignatedRevocationKeys(this.mainKey, config),
+      ...await getDesignatedRevocationKeys(sourceUser.mainKey, config)
+    ];
     await mergeSignatures(sourceUser, this, 'revocationSignatures', date, function(srcRevSig) {
-      return isDataRevoked(primaryKey, enums.signature.certRevocation, dataToVerify, [srcRevSig], undefined, undefined, date, config);
+      return isDataRevoked(
+        primaryKey, enums.signature.certRevocation, dataToVerify, [srcRevSig], undefined, undefined, date, config,
+        designatedRevocationKeys
+      );
     });
   }
 

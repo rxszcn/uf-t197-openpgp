@@ -70,7 +70,8 @@ class Subkey {
       primaryKey, enums.signature.subkeyRevocation, {
         key: primaryKey,
         bind: this.keyPacket
-      }, this.revocationSignatures, signature, key, date, config
+      }, this.revocationSignatures, signature, key, date, config,
+      await helper.getDesignatedRevocationKeys(this.mainKey, config)
     );
   }
 
@@ -159,8 +160,15 @@ class Subkey {
       }
     });
     // revocation signatures
+    const designatedRevocationKeys = [
+      ...await helper.getDesignatedRevocationKeys(this.mainKey, config),
+      ...await helper.getDesignatedRevocationKeys(subkey.mainKey, config)
+    ];
     await helper.mergeSignatures(subkey, this, 'revocationSignatures', date, function(srcRevSig) {
-      return helper.isDataRevoked(primaryKey, enums.signature.subkeyRevocation, dataToVerify, [srcRevSig], undefined, undefined, date, config);
+      return helper.isDataRevoked(
+        primaryKey, enums.signature.subkeyRevocation, dataToVerify, [srcRevSig], undefined, undefined, date, config,
+        designatedRevocationKeys
+      );
     });
   }
 

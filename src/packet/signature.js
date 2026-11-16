@@ -821,7 +821,12 @@ class SignaturePacket {
         throw new Error(`Unknown critical notation: ${name}`);
       }
     });
-    if (this.revocationKeyClass !== null) {
+    if (this.revocationKeyClass !== null &&
+        this.signatureType !== enums.signature.key) {
+      // Per RFC4880 5.2.3.15, the Revocation Key subpacket is only found on a Direct Key
+      // self-signature (Type ID 0x1F); its use on other signature types is unspecified,
+      // hence we still reject it there, to avoid interpreting an authorization the issuer
+      // may not have intended to make.
       throw new Error('This key is intended to be revoked with an authorized key, which OpenPGP.js does not support.');
     }
   }
